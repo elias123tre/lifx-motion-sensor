@@ -1,14 +1,45 @@
-import paho.mqtt.client as mqtt                 # MQTT paho library
+import logging  # Logging library
+import subprocess  # Library to send shell commands from python
+from os import remove  # Remove file function
+from time import sleep  # Sleep function
+
+import paho.mqtt.client as mqtt  # MQTT paho library
+import requests  # Lifx HTTP requests
 from gpiozero import LED, Button, MotionSensor  # gpiozero library
-from time import sleep                          # Sleep function
-import requests                                 # Lifx HTTP requests
+from lifxlan import LifxLAN  # Lifx Lan requests
+
 print("Import done")
 
-# Lifx HTTP api token
-TOKEN = ""
+remove("lifx.log")
+print("Log file cleared")
+
+console_logging_format = "%(levelname)s: %(funcName)s @ %(lineno)d - %(name)s: %(message)s"
+file_logging_format = "%(levelname)s: %(asctime)s: %(name)s: %(message)s"
+# Console logging
+logging.basicConfig(level=logging.DEBUG, format=console_logging_format)
+logger = logging.getLogger()
+# Create a file handler for output file
+handler = logging.FileHandler("lifx.log")
+formatter = logging.Formatter(file_logging_format)
+handler.setFormatter(formatter)
+
+logger.addHandler(handler)
+logger.info("This is saved to the log")
+
+# Rclone to publish lifx.py to google drive
+subprocess.run(
+    'rclone sync "lifx.py" "drive:Filer/RaspberryPi" -P', shell=True)
+
+# Lifx lan environment and number of devices
+lan = LifxLAN(1)
 # Label of light to be controlled
 label = "Taklampa"
-# Time until ligth turns off after no motion, defined in minutes
+# Get light(s) (add more by adding a list [])
+bulb = lan.get_device_by_name(label)
+logging.info("Light found: " + bulb.get_label())
+# Lifx HTTP api token, deprecated
+TOKEN = "c6df528836417f584c1eeff650329a767ed7bd6bcd4a7adc02766bf74fcbc2eb"
+# Time until light turns off after no motion, defined in minutes
 timer = 15
 
 # GPIO pins
@@ -19,25 +50,24 @@ b2 = Button(22)         # Button 2, physical pin: 15
 b3 = Button(23)         # Button 3, physical pin: 16
 b4 = Button(24)         # Button 4, physical pin: 18
 
-# Lifx states
-on = {
-    "power": "on",
-    "duration": 1.5,
-}
-off = {
-    "power": "off",
-    "duration": 1.5,
-}
+# Lifx states in brightness
+on = 65535
+off = 0
 
 temptimer = 0       # Define countdown variable
 sensor = True       # Define initial sensor state, use same as initial led state
-light = True        # Define initial lifx light state
+if bulb.get_power() == on:
+    light = True        # Define initial lifx light state
+else:
+    light = False       # Define initial lifx light state
+logging.debug("Sensor: " + str(sensor) + " Light: " + str(light))
 
 
 def sensorToggle():
     global sensor
     global temptimer
     global light
+    print("Before publish")
     if sensor == False:      # When toggeling if already true
         onboard.on()                    # Turn on onboard LED
         lifx(on)
@@ -58,15 +88,15 @@ def sensorToggle():
         pir.when_motion = None          # Disable PIR callbacks
         pir.when_no_motion = None       # Disable PIR callbacks
     # Publish sensor state
-    client.publish("lifxhomeauto/status", payload=bool(sensor))
-    print("Sensor is now", bool(sensor))
+    client.publish("lifxhomeauto/sensor", payload=bool(sensor))
+    logging.debug("Sensor state: " + str(bool(sensor)))
 
 
 def motionOn():
     global light
     global temptimer
     print()
-    print("Motion detected")
+    logging.debug("Motion detected")
     temptimer = 0
     if light == False:
         lifx(on)
@@ -76,39 +106,60 @@ def motionOn():
 def motionOff():
     global light
     global temptimer
-    print("No motion, starting timer")
+    logging.debug("No motion, starting timer")
     temptimer = 1       # Start countdown timer as while loop
 
 
 def on_message(client, userdata, msg):
-    print("Topic:", msg.topic)
-    print("Message:", str(msg.payload.decode("utf-8")))
-    sensorToggle()
+    if str(msg.topic) == "lifxhomeauto/toggle":
+        sensorToggle()
+
+    logging.debug("Topic: " + str(msg.topic))
+    logging.debug("Message: " + str(msg.payload.decode("utf-8")))
+
+
+def on_disconnect(client, userdata, rc):
+    logging.warning("MQTT Disconnected")
+    logging.debug(client.error_string(rc))
+    logging.debug("Reconnecting")
+    client.reconnect()
+
+
+# def on_log(client, obj, level, string):
+#     print(string)
+
+
+# def on_log(client, userdata, level, buf):
+#     if "PING" in buf:
+#         print
 
 
 def lifx(state):
-    response = requests.put("https://api.lifx.com/v1/lights/label:" + label +
-                            "/state", data=state, headers={"Authorization": "Bearer %s" % TOKEN, })
-    print("Light powered", state["power"] + ".", response)
+    bulb.set_power(state, True)
+    logging.debug("Light brightness: " + str(state))
 
 
-print("Setting up GPIO pins")
+logging.info("Setting up GPIO pins")
 pir.when_motion = motionOn      # Callback when motion
 pir.when_no_motion = motionOff  # Callback when no motion
 
 b1.when_pressed = sensorToggle  # Callback when button 1 pressed
 
-print("Setting up MQTT client")
+logging.info("Setting up MQTT client")
 client = mqtt.Client()
+client.enable_logger()
 client.on_message = on_message
-client.connect("broker.mqttdashboard.com")
+client.on_disconnect = on_disconnect
+# client.on_log = on_log
+client.connect("iot.eclipse.org")
 client.loop_start()
-client.subscribe("lifxhomeauto/state", 2)
+client.subscribe("lifxhomeauto/toggle", 2)
+# client.subscribe("lifxhomeauto/state", 0)
 
 sleep(1)  # Wait for GPIO to initialize
 
 
-print("Initializing loop")
+logging.info("Initializing loop")
 try:
     while True:
         while temptimer > 0:
@@ -119,12 +170,12 @@ try:
                 temptimer = 0
                 lifx(off)
                 light = False
-                print("No motion for", timer, "minutes")
+                logging.debug("No motion for " + str(timer) + " minutes")
 
 except (KeyboardInterrupt, SystemExit):
     print()
     print("KeyboardInterrupt detected, exiting...")
     client.loop_stop()
     raise
-except:
-    print("Exit and cleanup sucsessful")
+except Exception:
+    logger.exception("Error has occurred")
